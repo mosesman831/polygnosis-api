@@ -2,19 +2,19 @@
 
 from __future__ import annotations
 
-from enum import Enum
+from enum import StrEnum
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
 
-class ScoringAlgorithm(str, Enum):
+class ScoringAlgorithm(StrEnum):
     rrf = "rrf"
     borda = "borda"
     hybrid = "hybrid"
 
 
-class JobStatus(str, Enum):
+class JobStatus(StrEnum):
     queued = "queued"
     running = "running"
     completed = "completed"
@@ -42,12 +42,11 @@ class PhaseOutcome(BaseModel):
 
 
 class BoardroomRequest(BaseModel):
-    # max_length is a safety cap; main enforces OBJECTIVE_MAX_CHARS as the
-    # authoritative limit (default 20000) and returns 422 when exceeded.
+    # No max_length here: main enforces settings.objective_max_chars as the
+    # authoritative limit and returns 422 when exceeded.
     objective: str = Field(
         ...,
         min_length=1,
-        max_length=20000,
         description="High-stakes problem to solve",
     )
     scoring_algorithm: ScoringAlgorithm | None = Field(
@@ -58,6 +57,10 @@ class BoardroomRequest(BaseModel):
     early_resolution: bool | None = None
     quality_gate: bool | None = None
     max_debate_rounds: int | None = Field(default=None, ge=1, le=5)
+    include_solutions: bool = Field(
+        default=False,
+        description="Include full solver solution text in the HTTP trail (artifacts always retain it)",
+    )
 
 
 class BoardroomCreateResponse(BaseModel):
@@ -112,6 +115,11 @@ class BoardroomJobResponse(BaseModel):
     created_at: str
     updated_at: str
     result: BoardroomResult | None = None
+
+
+class BoardroomListResponse(BaseModel):
+    jobs: list[BoardroomJobResponse] = []
+    count: int = 0
 
 
 class HealthResponse(BaseModel):
