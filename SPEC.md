@@ -1,8 +1,9 @@
 # PolyGnosis API
 
-> **LatticeAG · Poly series** · Status: shipping (in-tree; extract to `mosesman831/polygnosis-api`)
+> **LatticeAG · Poly series** · Status: protocol solid; service wrapper prototype (see `docs/PRODUCTION_OSS_PLAN.md`)
 > **Type:** Public service API
 > **Protocol:** PolyGnosis v3 (full boardroom)
+> **Extract target:** `mosesman831/polygnosis-api`
 
 ## Problem
 
