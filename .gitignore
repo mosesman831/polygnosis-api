@@ -4,6 +4,7 @@ __pycache__/
 venv/
 .env
 artifacts/
+data/
 .corrections_buffer.json
 .pytest_cache/
 .ruff_cache/
