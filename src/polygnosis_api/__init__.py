@@ -1,3 +1,8 @@
 """PolyGnosis API — adversarial multi-model consensus over HTTP."""
 
-__version__ = "1.0.0"
+from importlib.metadata import PackageNotFoundError, version
+
+try:
+    __version__ = version("polygnosis-api")
+except PackageNotFoundError:  # not installed (e.g. running from source tree)
+    __version__ = "0.2.0"
