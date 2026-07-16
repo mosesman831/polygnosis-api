@@ -134,3 +134,4 @@ class ReadyResponse(BaseModel):
     config_loaded: bool
     gateway_key_configured: bool
     auth_required: bool
+    jobs: dict[str, int] = {}
