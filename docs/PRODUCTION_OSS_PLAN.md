@@ -1,6 +1,6 @@
 # Production / OSS readiness plan
 
-Status: **accepted** — frozen into `docs/BUILD_SPEC.md` for the v0.2 build.
+Status: **built / landed in 0.2** — the v0.2 cut frozen in `docs/BUILD_SPEC.md` is implemented (M0–M5), with CI running `ruff` + `pytest`. M6 polish items are largely in (`solver_count` orchestration, `models.scorer`, reflexion off by default, `/health` + `/ready` split, `job_id` logging, graceful shutdown). Remaining M6 work (artifact retention/TTL) stays deferred.
 
 Derived from `SPEC.md`, the current `src/polygnosis_api` tree, and an architecture review of what actually blocks a trustworthy public release.
 
@@ -172,17 +172,17 @@ Ship a **0.x** or keep `1.0.0` only after M0–M5. Calling the current tree “s
 
 ## Spec delta checklist (when building)
 
-Update `SPEC.md` / README when code lands:
+Updated in `SPEC.md` / README as code landed:
 
-- [ ] Inbound auth model  
-- [ ] Job durability + restart semantics  
-- [ ] Degraded vs completed vs failed  
-- [ ] `scoring` in HTTP response  
-- [ ] Early-resolution ranking / artifact rules  
-- [ ] Quality gate fail-closed behavior  
-- [ ] Reflexion default (off for public)  
-- [ ] Install paths (`pip install` + config discovery)  
-- [ ] Versioning policy (0.x until M5)  
+- [x] Inbound auth model  
+- [x] Job durability + restart semantics  
+- [x] Degraded vs completed vs failed  
+- [x] `scoring` in HTTP response  
+- [x] Early-resolution ranking / artifact rules  
+- [x] Quality gate fail-closed behavior  
+- [x] Reflexion default (off for public)  
+- [x] Install paths (`pip install` + config discovery)  
+- [x] Versioning policy (0.x until M5)  
 
 ---
 

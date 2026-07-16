@@ -199,6 +199,6 @@ Add `enabled: bool = True` to `__init__`; when False, `load→[]`, `injection→
 - [ ] Auth + 429 work
 - [ ] Jobs survive process restart (SQLite)
 - [ ] Degraded/failed honesty as specified
-- [ ] `scoring` present on completed responses
-- [ ] CI green
-- [ ] README/SPEC match behavior
+- [x] `scoring` present on completed responses (covered by tests)
+- [x] CI green (`ruff` + `pytest`; `tests/` for config, jobs, api, pipeline)
+- [x] README/SPEC match behavior
