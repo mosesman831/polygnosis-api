@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -18,11 +18,38 @@ class JobStatus(str, Enum):
     queued = "queued"
     running = "running"
     completed = "completed"
+    completed_degraded = "completed_degraded"
     failed = "failed"
 
 
+class ConsensusEntry(BaseModel):
+    """A single solver's placement in the consensus ranking."""
+
+    rank: int
+    avg_rank: float | None = None
+    rrf_score: float | None = None
+    borda_score: float | None = None
+    score: float | None = None
+    note: str | None = None
+
+
+class PhaseOutcome(BaseModel):
+    """Outcome record for a single pipeline phase."""
+
+    phase: str
+    status: Literal["ok", "degraded", "failed"]
+    detail: str | None = None
+
+
 class BoardroomRequest(BaseModel):
-    objective: str = Field(..., min_length=1, description="High-stakes problem to solve")
+    # max_length is a safety cap; main enforces OBJECTIVE_MAX_CHARS as the
+    # authoritative limit (default 20000) and returns 422 when exceeded.
+    objective: str = Field(
+        ...,
+        min_length=1,
+        max_length=20000,
+        description="High-stakes problem to solve",
+    )
     scoring_algorithm: ScoringAlgorithm | None = Field(
         default=None,
         description="Override config: rrf | borda | hybrid",
@@ -62,13 +89,18 @@ class BoardroomResult(BaseModel):
     personas: list[str] = []
     early_resolution: bool = False
     scoring_algorithm: str = "hybrid"
-    consensus_ranking: dict[str, Any] = {}
+    # Prefer typed ConsensusEntry values; pydantic coerces plain dicts into
+    # ConsensusEntry, so callers may still pass raw dicts.
+    consensus_ranking: dict[str, ConsensusEntry] = {}
     quality_gate: dict[str, Any] | None = None
     final_output: str | None = None
     meta_review: str | None = None
     trail: list[SolverTrailItem] = []
-    artifacts_dir: str | None = None
     reflexion_buffer_size: int = 0
+    scoring: dict[str, Any] | None = None
+    warnings: list[str] = []
+    degraded: bool = False
+    phase_outcomes: list[PhaseOutcome] = []
 
 
 class BoardroomJobResponse(BaseModel):
@@ -86,3 +118,11 @@ class HealthResponse(BaseModel):
     status: str
     version: str
     protocol: str = "polygnosis-v3"
+
+
+class ReadyResponse(BaseModel):
+    status: str
+    version: str
+    config_loaded: bool
+    gateway_key_configured: bool
+    auth_required: bool
