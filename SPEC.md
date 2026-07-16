@@ -1,9 +1,24 @@
 # PolyGnosis API
 
-> **LatticeAG · Poly series** · Status: **v0.2 build target** — see `docs/BUILD_SPEC.md`
+> **LatticeAG · Poly series** · Status: **v0.3.0 built** — see `docs/BUILD_SPEC_v0.3.md`
 > **Type:** Public service API
-> **Protocol:** PolyGnosis v3 (full boardroom)
+> **Protocol:** PolyGnosis v3 (full boardroom), `PROTOCOL_VERSION = "polygnosis-v3"`
 > **Extract target:** `mosesman831/polygnosis-api`
+
+## v0.3 contract additions
+
+Built on top of the v0.2 protocol below:
+
+- `GET /v1/boardroom` — list recent jobs, newest first (`limit` default 20, max 100), same auth as other `/v1` routes.
+- `include_solutions` request field (default `false`) — when false, `trail[].solution` is `null` in the HTTP body; artifacts on disk always retain full text.
+- Real job **leases** (`claim_next` reclaims expired running rows) + SQLite **WAL**; restart recovery only fails expired leases.
+- Atomic in-flight create (`create_if_capacity`) — the 429 capacity check and insert happen in one locked transaction.
+- Constant-time auth (`hmac.compare_digest`) for Bearer / `X-API-Key`.
+- Per-role `temperature` + `max_tokens` (solver hotter, scorer deterministic); pooled `httpx.Client`; global LLM concurrency cap.
+- Objective length enforced by `settings.objective_max_chars` in the route (422), not by the schema.
+- Solver heterogeneity warning → `degraded` when two solvers share a model.
+- Observability: request-logging middleware, per-phase `timings.json`, and `/ready` job counts.
+- `/health` and `/ready` report `protocol = polygnosis-v3`.
 
 ## Problem
 
@@ -92,7 +107,7 @@ Empty Layer-1 rankings (non-early path) → job **failed** (not a silent empty c
 - **Artifacts on disk.** Every job writes a run directory; paths are not exposed on the public HTTP result.
 - **Reflexion opt-in.** Cross-run buffer default off (not multi-tenant safe).
 
-## Non-goals (v0.2)
+## Non-goals (still deferred in v0.3)
 
 - Hermes / Eve agent sessions with live tools
 - Sub-second claim verification

@@ -1,7 +1,24 @@
 # Build spec — PolyGnosis API v0.3 (improve every element)
 
-Status: **ready to build** on top of v0.2.
+Status: **built** — shipped as `0.3.0` on top of v0.2.
 Target version: **`0.3.0`**.
+
+## Acceptance (v0.3)
+
+- [x] Real job leases (`claim_next` reclaims expired running rows; fresh peer leases untouched) — `tests/test_jobs.py`
+- [x] Atomic in-flight create → 429 via `create_if_capacity` — `tests/test_api.py`
+- [x] Constant-time auth (`hmac.compare_digest`); 401 without key — `tests/test_api.py`
+- [x] Objective cap enforced in-route (422), not in schema — `tests/test_api.py`
+- [x] Per-role temperature + max_tokens sent to gateway — `tests/test_llm.py`
+- [x] Heterogeneity warning + degraded solve when solvers share a model — `tests/test_pipeline.py`
+- [x] SQLite WAL + busy_timeout on connect — `src/polygnosis_api/jobs.py`
+- [x] `timings.json` written per run; `/ready` job counts — `tests/test_pipeline.py`, `tests/test_api.py`
+- [x] `include_solutions` nulls trail solutions when false — `tests/test_pipeline.py`, `tests/test_api.py`
+- [x] `GET /v1/boardroom` list, newest first, auth-gated — `tests/test_api.py`
+- [x] `PROTOCOL_VERSION = "polygnosis-v3"` on `/health` + `/ready` — `tests/test_api.py`
+- [x] No `requirements.txt`; `dist/` gitignored; version bumped to `0.3.0`
+- [x] Docs: README, SPEC, SECURITY.md, CONTRIBUTING.md, `.env.example`
+- [x] `ruff check src tests` and `pytest` green
 
 Do everything below. Do not invent Hermes/Eve, Redis multi-instance, or mid-pipeline resume.
 
