@@ -39,6 +39,15 @@ class Settings(BaseSettings):
     reflexion_enabled: bool = False
     objective_max_chars: int = 20000
 
+    max_llm_concurrency: int = 8
+    temperature_solver: float = 0.5
+    temperature_critic: float = 0.2
+    temperature_scorer: float = 0.0
+    temperature_default: float = 0.3
+    max_tokens_solver: int = 8192
+    max_tokens_default: int = 4096
+    job_lease_seconds: int = 3600
+
 
 def resolve_config_path(explicit: str | Path | None = None) -> Path:
     """Locate the boardroom config file.

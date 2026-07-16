@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+import threading
+
 import httpx
 import pytest
 
@@ -31,33 +34,41 @@ class _FakeResponse:
 
 
 class _FakeClient:
-    """Context-manager client that pops queued responses/exceptions per post()."""
+    """Pooled client stand-in that pops queued responses/exceptions per post()."""
 
     def __init__(self, outcomes: list):
         self._outcomes = outcomes
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
+        self.post_calls: list[dict] = []
+        self.closed = False
 
     def post(self, *args, **kwargs):
+        self.post_calls.append(kwargs)
         outcome = self._outcomes.pop(0)
         if isinstance(outcome, Exception):
             raise outcome
         return outcome
 
+    def close(self) -> None:
+        self.closed = True
 
-def _install_fake_client(monkeypatch, outcomes: list) -> None:
-    """Patch httpx.Client so each construction serves the shared outcome queue."""
+
+def _install_fake_client(monkeypatch, outcomes: list) -> list:
+    """Patch httpx.Client so every construction serves the shared outcome queue.
+
+    Returns a list that records each constructed ``_FakeClient`` so tests can
+    assert on pool reuse (one construction) and captured post kwargs.
+    """
+    constructed: list[_FakeClient] = []
 
     def _factory(*args, **kwargs):
-        return _FakeClient(outcomes)
+        client = _FakeClient(outcomes)
+        constructed.append(client)
+        return client
 
     monkeypatch.setattr(httpx, "Client", _factory)
     # Never actually sleep during backoff.
     monkeypatch.setattr("polygnosis_api.llm.time.sleep", lambda *_: None)
+    return constructed
 
 
 def _client() -> LLMClient:
@@ -70,6 +81,31 @@ def test_extract_json_unchanged_fenced():
 
 def test_extract_json_unchanged_braces():
     assert extract_json('prose {"a": 1} more') == '{"a": 1}'
+
+
+def test_extract_json_prose_then_json():
+    text = 'Here is the result you asked for: {"answer": 42, "ok": true}. Thanks!'
+    candidate = extract_json(text)
+    assert json.loads(candidate) == {"answer": 42, "ok": True}
+
+
+def test_extract_json_multiple_top_level_objects_takes_first():
+    # Two adjacent objects: the outermost brace slice would be invalid JSON,
+    # so raw_decode must return only the first complete object.
+    candidate = extract_json('{"a": 1} {"b": 2}')
+    assert json.loads(candidate) == {"a": 1}
+
+
+def test_extract_json_nested_with_prose():
+    text = 'noise before {"a": {"b": [1, 2]}, "c": 3} noise after }'
+    candidate = extract_json(text)
+    assert json.loads(candidate) == {"a": {"b": [1, 2]}, "c": 3}
+
+
+def test_extract_json_fenced_with_trailing_prose():
+    text = '```json\n{"x": 1} trailing junk\n```'
+    candidate = extract_json(text)
+    assert json.loads(candidate) == {"x": 1}
 
 
 def test_retry_500_then_200_returns_content(monkeypatch):
@@ -120,6 +156,103 @@ def test_timeout_then_success(monkeypatch):
     assert result == "recovered"
 
 
+def test_pool_is_reused_across_calls(monkeypatch):
+    outcomes = [
+        _FakeResponse(200, content="one"),
+        _FakeResponse(200, content="two"),
+    ]
+    constructed = _install_fake_client(monkeypatch, outcomes)
+
+    client = _client()
+    assert client.complete("a") == "one"
+    assert client.complete("b") == "two"
+
+    # A single pooled client should have been constructed and reused.
+    assert len(constructed) == 1
+    assert len(constructed[0].post_calls) == 2
+
+
+def test_per_request_timeout_is_passed(monkeypatch):
+    outcomes = [_FakeResponse(200, content="ok")]
+    constructed = _install_fake_client(monkeypatch, outcomes)
+
+    _client().complete("hi", timeout=12.5)
+
+    assert constructed[0].post_calls[0]["timeout"] == 12.5
+
+
+def test_close_closes_pooled_client(monkeypatch):
+    outcomes = [_FakeResponse(200, content="ok")]
+    constructed = _install_fake_client(monkeypatch, outcomes)
+
+    client = _client()
+    client.complete("hi")
+    client.close()
+
+    assert constructed[0].closed is True
+
+
+def test_max_tokens_included_in_payload_when_set(monkeypatch):
+    outcomes = [_FakeResponse(200, content="ok")]
+    constructed = _install_fake_client(monkeypatch, outcomes)
+
+    _client().complete("hi", max_tokens=256, temperature=0.7)
+
+    payload = constructed[0].post_calls[0]["json"]
+    assert payload["max_tokens"] == 256
+    assert payload["temperature"] == 0.7
+
+
+def test_max_tokens_omitted_when_none(monkeypatch):
+    outcomes = [_FakeResponse(200, content="ok")]
+    constructed = _install_fake_client(monkeypatch, outcomes)
+
+    _client().complete("hi")
+
+    payload = constructed[0].post_calls[0]["json"]
+    assert "max_tokens" not in payload
+
+
+def test_semaphore_does_not_break_retries(monkeypatch):
+    # A size-1 semaphore must be released between attempts so retries proceed.
+    monkeypatch.setattr("polygnosis_api.llm._semaphore", threading.Semaphore(1))
+    outcomes = [
+        _FakeResponse(503),
+        _FakeResponse(500),
+        _FakeResponse(200, content="through the gate"),
+    ]
+    _install_fake_client(monkeypatch, outcomes)
+
+    result = _client().complete("hi")
+
+    assert result == "through the gate"
+    assert outcomes == []
+
+
+class _ConcurrencySettings:
+    """Settings variant carrying max_llm_concurrency (Owner C adds it)."""
+
+    api_key = "test-key"
+    api_base_url = "https://example.test/v1"
+    default_model = "test-model"
+    max_llm_concurrency = 3
+
+
+def test_semaphore_reads_settings_concurrency(monkeypatch):
+    # Global semaphore is created lazily from settings.max_llm_concurrency.
+    monkeypatch.setattr("polygnosis_api.llm._semaphore", None)
+    outcomes = [_FakeResponse(200, content="ok")]
+    _install_fake_client(monkeypatch, outcomes)
+
+    client = LLMClient(_ConcurrencySettings())
+    assert client.complete("hi") == "ok"
+
+    import polygnosis_api.llm as llm_mod
+
+    # Value restored to 3 after acquire/release → initial value came from settings.
+    assert llm_mod._semaphore._value == 3
+
+
 class _FakeSettings:
     """Lightweight settings carrying the llm_max_retries knob (Owner A adds it)."""
 
@@ -130,11 +263,11 @@ class _FakeSettings:
 
 
 def test_respects_custom_max_retries(monkeypatch):
-    client = LLMClient(_FakeSettings())
-
     # 1 initial + 1 retry = 2 attempts; both fail → "".
     outcomes = [_FakeResponse(500) for _ in range(2)]
     _install_fake_client(monkeypatch, outcomes)
+
+    client = LLMClient(_FakeSettings())
 
     assert client.complete("hi") == ""
     assert outcomes == []

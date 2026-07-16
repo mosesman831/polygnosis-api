@@ -27,7 +27,19 @@ settings:
   scoring_algorithm: "hybrid"
   rrf_k: 60
 
+  # max_debate_rounds = N means N critique passes; revisions happen between
+  # rounds. So N=1 is critique only (no revise); N=2 is critique, revise,
+  # critique; and so on.
   max_debate_rounds: 2
   min_solvers_for_quorum: 2
   quality_gate_enabled: true
   early_resolution_enabled: true
+
+  # Per-role sampling. Solvers run hotter for diversity; scorer is
+  # deterministic. Defaults apply to any role not listed here.
+  temperature_solver: 0.5
+  temperature_critic: 0.2
+  temperature_scorer: 0.0
+  temperature_default: 0.3
+  max_tokens_solver: 8192
+  max_tokens_default: 4096

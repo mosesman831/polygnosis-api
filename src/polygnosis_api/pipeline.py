@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 import logging
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
-from polygnosis_api.consensus import compute_consensus_ranking
 from polygnosis_api.config import get_role_model, get_solver_model_name
+from polygnosis_api.consensus import compute_consensus_ranking
 from polygnosis_api.llm import LLMClient, extract_json
 from polygnosis_api.personas import classify_persona_tools
 from polygnosis_api.prompts import (
@@ -29,6 +30,27 @@ from polygnosis_api.reflexion import ReflexionBuffer
 logger = logging.getLogger("polygnosis_api.pipeline")
 
 ProgressCallback = Callable[[str, str | None], None]
+
+
+def _fill_ranking_scores(
+    consensus_ranking: dict[str, dict[str, Any]], algorithm: str
+) -> None:
+    """Ranking shape honesty (S11).
+
+    ``rrf``/``borda`` modes emit a generic ``score`` field; mirror it into the
+    matching named field (``rrf_score``/``borda_score``) so the trail and API
+    payload aren't mysteriously null. Hybrid already sets both, so it's left
+    untouched.
+    """
+    if algorithm == "rrf":
+        named = "rrf_score"
+    elif algorithm == "borda":
+        named = "borda_score"
+    else:
+        return
+    for entry in consensus_ranking.values():
+        if entry.get(named) is None and "score" in entry:
+            entry[named] = entry["score"]
 
 
 class BoardroomPipeline:
@@ -52,6 +74,7 @@ class BoardroomPipeline:
         *,
         job_id: str | None = None,
         on_progress: ProgressCallback | None = None,
+        include_solutions: bool = True,
     ) -> dict[str, Any]:
         settings = self.cfg.get("settings", {})
         run_id = job_id or time.strftime("%Y%m%d_%H%M%S")
@@ -64,9 +87,20 @@ class BoardroomPipeline:
         phase_outcomes: list[dict[str, Any]] = []
         degraded = False
 
+        # Per-phase wall-clock timings (seconds), flushed to timings.json after
+        # each phase so partial timings survive a crash mid-run.
+        phase_timings: dict[str, float] = {}
+
         def record(phase: str, status: str, detail: str = "") -> None:
             """Append a per-phase outcome (status ∈ ok|degraded|failed)."""
             phase_outcomes.append({"phase": phase, "status": status, "detail": detail})
+
+        def flush_timings() -> None:
+            (run_dir / "timings.json").write_text(json.dumps(phase_timings, indent=2))
+
+        def mark_timing(phase: str, started_at: float) -> None:
+            phase_timings[phase] = round(time.perf_counter() - started_at, 3)
+            flush_timings()
 
         def progress(phase: str, detail: str | None = None) -> None:
             logger.info("job_id=%s phase=%s detail=%s", run_id, phase, detail)
@@ -74,27 +108,42 @@ class BoardroomPipeline:
                 on_progress(phase, detail)
 
         progress("orchestrate", "Building problem statement + personas")
+        _t = time.perf_counter()
         problem_statement, success_criteria, personas, domain = self._orchestrate(
             objective, run_dir, solver_count
         )
+        mark_timing("orchestrate", _t)
         record("orchestrate", "ok", f"{len(personas)} personas, domain={domain}")
 
         progress("solve", f"Parallel solve with {solver_count} personas")
-        solver_results, dead = self._parallel_solve(
+        _t = time.perf_counter()
+        solver_results, dead, solve_warnings = self._parallel_solve(
             problem_statement, personas, run_dir, solver_count
         )
+        mark_timing("solve", _t)
         if dead:
             msg = f"{len(dead)} solver(s) failed or returned empty"
             warnings.append(msg)
             degraded = True
-            record("solve", "degraded", f"{len(solver_results)} alive; {msg}")
+        if solve_warnings:
+            warnings.extend(solve_warnings)
+            degraded = True
+        if dead or solve_warnings:
+            detail = f"{len(solver_results)} alive"
+            if dead:
+                detail += f"; {len(dead)} dead"
+            if solve_warnings:
+                detail += "; non-heterogeneous models"
+            record("solve", "degraded", detail)
         else:
             record("solve", "ok", f"{len(solver_results)} solvers alive")
 
         progress("early_resolution", "Quorum vote")
+        _t = time.perf_counter()
         early_resolved, consensus_ranking, scorer_solutions = self._early_resolution(
             problem_statement, solver_results, run_dir
         )
+        mark_timing("early_resolution", _t)
 
         critique_data: dict[int, Any] = {}
         scoring_json: dict[str, Any] = {}
@@ -113,12 +162,16 @@ class BoardroomPipeline:
         else:
             record("early_resolution", "ok", "no early resolution")
             progress("critique", "Adversarial critique + reflexion")
+            _t = time.perf_counter()
             critique_data = self._critique(problem_statement, solver_results, run_dir)
+            mark_timing("critique", _t)
             record("critique", "ok", f"{len(critique_data)} critiques")
             progress("scoring", "LLM axes → RRF/Borda/hybrid ranking")
+            _t = time.perf_counter()
             scoring_json, consensus_ranking, scorer_solutions = self._scoring(
                 problem_statement, solver_results, critique_data, run_dir
             )
+            mark_timing("scoring", _t)
             # Honest failure: a scorer that produces no ranking must fail the job
             # rather than fabricate a winner.
             if not consensus_ranking:
@@ -130,6 +183,7 @@ class BoardroomPipeline:
             raise RuntimeError("Scoring produced empty consensus ranking")
 
         progress("synthesis", "Meta-synthesis")
+        _t = time.perf_counter()
         synthesis = self._synthesis(
             problem_statement,
             solver_results,
@@ -138,12 +192,15 @@ class BoardroomPipeline:
             success_criteria,
             run_dir,
         )
+        mark_timing("synthesis", _t)
         record("synthesis", "ok", "synthesis produced")
 
         progress("quality_gate", "Constitutional quality gate")
+        _t = time.perf_counter()
         quality_gate_result, final_output = self._quality_gate(
             problem_statement, synthesis, consensus_ranking, solver_results, run_dir
         )
+        mark_timing("quality_gate", _t)
         verdict = quality_gate_result.get("verdict") if quality_gate_result else None
         if verdict == "ERROR":
             msg = "Quality gate returned non-JSON/empty output; verdict set to ERROR"
@@ -159,6 +216,7 @@ class BoardroomPipeline:
         (run_dir / "final_output.md").write_text(final_output)
 
         progress("meta_review", "Explaining consensus")
+        _t = time.perf_counter()
         meta_review = self._meta_review(
             problem_statement,
             consensus_ranking,
@@ -168,8 +226,10 @@ class BoardroomPipeline:
             quality_gate_result,
             run_dir,
         )
+        mark_timing("meta_review", _t)
         record("meta_review", "ok", "meta-review produced")
 
+        flush_timings()
         progress("complete", None)
 
         trail = []
@@ -190,7 +250,9 @@ class BoardroomPipeline:
                     "avg_rank": rank_info.get("avg_rank"),
                     "critic_score": crit.get("score"),
                     "critic_grade": crit.get("overall_grade"),
-                    "solution": sol["solution"],
+                    # Full text stays in artifact files; caller may strip it from
+                    # the payload via include_solutions=False.
+                    "solution": sol["solution"] if include_solutions else None,
                 }
             )
 
@@ -212,6 +274,7 @@ class BoardroomPipeline:
             "warnings": warnings,
             "degraded": degraded,
             "phase_outcomes": phase_outcomes,
+            "phase_timings": phase_timings,
             # Kept for internal/DB use; main strips it from the HTTP response.
             "artifacts_dir": str(run_dir),
             "reflexion_buffer_size": len(self.reflexion.load()),
@@ -227,6 +290,8 @@ class BoardroomPipeline:
         out = self.llm.complete(
             build_orchestrator_prompt(objective, solver_count),
             model,
+            temperature=float(settings.get("temperature_default", 0.3)),
+            max_tokens=int(settings.get("max_tokens_default", 4096)),
             timeout=float(settings.get("orchestrator_timeout_sec", 120)),
             label="orchestrator",
         )
@@ -259,10 +324,12 @@ class BoardroomPipeline:
         personas: list[str],
         run_dir: Path,
         solver_count: int,
-    ) -> tuple[dict[int, dict[str, Any]], list[tuple[int, str]]]:
+    ) -> tuple[dict[int, dict[str, Any]], list[tuple[int, str]], list[str]]:
         settings = self.cfg.get("settings", {})
         timeout = float(settings.get("solver_timeout_sec", 600))
         min_quorum = int(settings.get("min_solvers_for_quorum", 2))
+        temperature = float(settings.get("temperature_solver", 0.5))
+        max_tokens = int(settings.get("max_tokens_solver", 8192))
         reflexion_context = self.reflexion.injection()
 
         solver_results: dict[int, dict[str, Any]] = {}
@@ -278,7 +345,12 @@ class BoardroomPipeline:
                 problem_statement, persona, reflexion_context, toolsets, tool_class
             )
             text = self.llm.complete(
-                prompt, model, timeout=timeout, label=f"solver-{chr(65 + idx)}"
+                prompt,
+                model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=timeout,
+                label=f"solver-{chr(65 + idx)}",
             )
             if not text:
                 return idx, None, "empty response"
@@ -313,7 +385,24 @@ class BoardroomPipeline:
                 f"Insufficient solvers: {len(solver_results)} alive, "
                 f"{min_quorum} required. Dead: {dead}"
             )
-        return solver_results, dead
+
+        # Heterogeneity check (S3): distinct models make the boardroom adversarial.
+        # If any resolved model id repeats across alive solvers (e.g. two solvers
+        # fell back to the same default), the solve is degraded but still valid.
+        warnings: list[str] = []
+        model_counts: dict[str, int] = {}
+        for result in solver_results.values():
+            model_id = result.get("model")
+            if model_id:
+                model_counts[model_id] = model_counts.get(model_id, 0) + 1
+        duplicates = {m: c for m, c in model_counts.items() if c > 1}
+        if duplicates:
+            detail = ", ".join(
+                f"{m} ×{c}" for m, c in sorted(duplicates.items())
+            )
+            warnings.append(f"Solver models not fully heterogeneous: {detail}")
+
+        return solver_results, dead, warnings
 
     def _early_resolution(
         self,
@@ -342,6 +431,8 @@ class BoardroomPipeline:
         out = self.llm.complete(
             prompt,
             model,
+            temperature=float(settings.get("temperature_default", 0.3)),
+            max_tokens=int(settings.get("max_tokens_default", 4096)),
             timeout=float(settings.get("orchestrator_timeout_sec", 120)),
             label="quorum-judge",
         )
@@ -392,6 +483,10 @@ class BoardroomPipeline:
         debate_rounds = int(settings.get("max_debate_rounds", 2))
         critic_timeout = float(settings.get("critic_timeout_sec", 600))
         solver_timeout = float(settings.get("solver_timeout_sec", 600))
+        critic_temperature = float(settings.get("temperature_critic", 0.2))
+        critic_max_tokens = int(settings.get("max_tokens_default", 4096))
+        solver_temperature = float(settings.get("temperature_solver", 0.5))
+        solver_max_tokens = int(settings.get("max_tokens_solver", 8192))
         critic_model = get_role_model(self.cfg, "critic")
         critique_data: dict[int, Any] = {}
         alive = len(solver_results)
@@ -408,6 +503,8 @@ class BoardroomPipeline:
                 out = self.llm.complete(
                     prompt,
                     critic_model,
+                    temperature=critic_temperature,
+                    max_tokens=critic_max_tokens,
                     timeout=critic_timeout,
                     label=f"critic-{chr(65 + sid)}",
                 )
@@ -454,6 +551,8 @@ class BoardroomPipeline:
                     out = self.llm.complete(
                         prompt,
                         model,
+                        temperature=solver_temperature,
+                        max_tokens=solver_max_tokens,
                         timeout=solver_timeout,
                         label=f"revision-{chr(65 + sid)}",
                     )
@@ -505,6 +604,8 @@ class BoardroomPipeline:
         out = self.llm.complete(
             build_scoring_prompt(problem_statement, scorer_solutions),
             model,
+            temperature=float(settings.get("temperature_scorer", 0.0)),
+            max_tokens=int(settings.get("max_tokens_default", 4096)),
             timeout=float(settings.get("synthesizer_timeout_sec", 300)),
             label="scorer",
         )
@@ -517,6 +618,7 @@ class BoardroomPipeline:
         consensus_ranking = compute_consensus_ranking(
             scoring_json, algorithm=algorithm, k=rrf_k
         )
+        _fill_ranking_scores(consensus_ranking, algorithm)
         scoring_json["_consensus_algorithm"] = algorithm
         scoring_json["_consensus_ranking"] = consensus_ranking
         (run_dir / "scoring.json").write_text(json.dumps(scoring_json, indent=2))
@@ -552,6 +654,8 @@ class BoardroomPipeline:
                 algorithm,
             ),
             model,
+            temperature=float(settings.get("temperature_default", 0.3)),
+            max_tokens=int(settings.get("max_tokens_default", 4096)),
             timeout=float(settings.get("synthesizer_timeout_sec", 300)),
             label="synthesizer",
         )
@@ -594,6 +698,8 @@ class BoardroomPipeline:
                 problem_statement, synthesis, top_solution, top_label
             ),
             model,
+            temperature=float(settings.get("temperature_default", 0.3)),
+            max_tokens=int(settings.get("max_tokens_default", 4096)),
             timeout=float(settings.get("synthesizer_timeout_sec", 300)),
             label="quality-gate",
         )
@@ -641,6 +747,8 @@ class BoardroomPipeline:
                 quality_gate_result,
             ),
             model,
+            temperature=float(settings.get("temperature_default", 0.3)),
+            max_tokens=int(settings.get("max_tokens_default", 4096)),
             timeout=float(settings.get("meta_reviewer_timeout_sec", 180)),
             label="meta-reviewer",
         )

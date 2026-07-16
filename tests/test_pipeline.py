@@ -22,7 +22,16 @@ class FakeLLM:
         self.by_label = by_label
         self.calls: list[str] = []
 
-    def complete(self, prompt, model=None, *, temperature=0.3, timeout=300.0, label="llm"):
+    def complete(
+        self,
+        prompt,
+        model=None,
+        *,
+        temperature=0.3,
+        timeout=300.0,
+        label="llm",
+        max_tokens=None,
+    ):
         self.calls.append(label)
         if label in self.by_label:
             return self.by_label[label]
@@ -80,7 +89,15 @@ def _responses(**over: str) -> dict[str, str]:
     return base
 
 
-def _cfg(**settings_over) -> dict:
+def _cfg(
+    *, solver_model_ids: tuple[str, ...] = ("m1", "m2", "m3"), **settings_over
+) -> dict:
+    """Build a boardroom config for the FakeLLM pipeline.
+
+    Solvers get *distinct* model ids by default so the happy path is
+    heterogeneous (not degraded). Pass ``solver_model_ids`` with repeats to
+    exercise the S3 heterogeneity warning.
+    """
     settings = {
         "solver_count": 3,
         "min_solvers_for_quorum": 2,
@@ -94,7 +111,8 @@ def _cfg(**settings_over) -> dict:
     models = {role: "m" for role in (
         "orchestrator", "critic", "synthesizer", "scorer", "meta_reviewer", "fallback"
     )}
-    models.update({"solver_1": "m", "solver_2": "m", "solver_3": "m"})
+    for i, model_id in enumerate(solver_model_ids):
+        models[f"solver_{i + 1}"] = model_id
     return {"models": models, "solver_models": [], "settings": settings}
 
 
@@ -177,3 +195,54 @@ def test_below_quorum_raises(tmp_path):
     pipeline = _pipeline(tmp_path, _cfg(), responses)
     with pytest.raises(RuntimeError):
         pipeline.run("obj", job_id="no-quorum")
+
+
+def test_timings_json_written_after_run(tmp_path):
+    # S5: each phase records a wall-clock duration flushed to timings.json.
+    pipeline = _pipeline(tmp_path, _cfg(), _responses())
+    result = pipeline.run("obj", job_id="timed")
+
+    timings_path = tmp_path / "timed" / "timings.json"
+    assert timings_path.exists()
+    timings = json.loads(timings_path.read_text())
+    # The core phases should all have a recorded, non-negative duration.
+    for phase in ("orchestrate", "solve", "scoring", "synthesis", "meta_review"):
+        assert phase in timings
+        assert timings[phase] >= 0
+    # The in-result copy mirrors the file.
+    assert result["phase_timings"] == timings
+
+
+def test_heterogeneity_warning_when_solvers_share_model(tmp_path):
+    # S3: two solvers resolving to the same model id → warning + degraded solve.
+    cfg = _cfg(solver_model_ids=("dup", "dup", "solo"))
+    pipeline = _pipeline(tmp_path, cfg, _responses())
+    result = pipeline.run("obj", job_id="hetero")
+
+    assert result["degraded"] is True
+    assert any(
+        "not fully heterogeneous" in w for w in result["warnings"]
+    ), result["warnings"]
+    solve_outcome = next(
+        o for o in result["phase_outcomes"] if o["phase"] == "solve"
+    )
+    assert solve_outcome["status"] == "degraded"
+
+
+def test_include_solutions_false_nulls_trail(tmp_path):
+    # S9: full solution text is stripped from the trail when not requested.
+    pipeline = _pipeline(tmp_path, _cfg(), _responses())
+    result = pipeline.run("obj", job_id="no-sol", include_solutions=False)
+
+    assert result["trail"]
+    assert all(item["solution"] is None for item in result["trail"])
+
+
+def test_include_solutions_true_keeps_trail(tmp_path):
+    # S9: full solution text stays in the trail when explicitly requested.
+    pipeline = _pipeline(tmp_path, _cfg(), _responses())
+    result = pipeline.run("obj", job_id="with-sol", include_solutions=True)
+
+    assert result["trail"]
+    solutions = {item["solution"] for item in result["trail"]}
+    assert solutions == {"SOLUTION A", "SOLUTION B", "SOLUTION C"}
