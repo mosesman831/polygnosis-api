@@ -57,19 +57,39 @@ class BoardroomPipeline:
         run_id = job_id or time.strftime("%Y%m%d_%H%M%S")
         run_dir = self.artifacts_root / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
+        solver_count = min(int(settings.get("solver_count", 3)), 5)
+
+        # Honest-results tracking accumulated across the whole run.
+        warnings: list[str] = []
+        phase_outcomes: list[dict[str, Any]] = []
+        degraded = False
+
+        def record(phase: str, status: str, detail: str = "") -> None:
+            """Append a per-phase outcome (status ∈ ok|degraded|failed)."""
+            phase_outcomes.append({"phase": phase, "status": status, "detail": detail})
 
         def progress(phase: str, detail: str | None = None) -> None:
-            logger.info("phase=%s detail=%s", phase, detail)
+            logger.info("job_id=%s phase=%s detail=%s", run_id, phase, detail)
             if on_progress:
                 on_progress(phase, detail)
 
         progress("orchestrate", "Building problem statement + personas")
         problem_statement, success_criteria, personas, domain = self._orchestrate(
-            objective, run_dir
+            objective, run_dir, solver_count
         )
+        record("orchestrate", "ok", f"{len(personas)} personas, domain={domain}")
 
-        progress("solve", f"Parallel solve with {len(personas)} personas")
-        solver_results = self._parallel_solve(problem_statement, personas, run_dir)
+        progress("solve", f"Parallel solve with {solver_count} personas")
+        solver_results, dead = self._parallel_solve(
+            problem_statement, personas, run_dir, solver_count
+        )
+        if dead:
+            msg = f"{len(dead)} solver(s) failed or returned empty"
+            warnings.append(msg)
+            degraded = True
+            record("solve", "degraded", f"{len(solver_results)} alive; {msg}")
+        else:
+            record("solve", "ok", f"{len(solver_results)} solvers alive")
 
         progress("early_resolution", "Quorum vote")
         early_resolved, consensus_ranking, scorer_solutions = self._early_resolution(
@@ -80,21 +100,34 @@ class BoardroomPipeline:
         scoring_json: dict[str, Any] = {}
 
         if early_resolved:
+            # Early resolution is honest, not degraded. Persist a scoring.json so the
+            # early-resolution path exposes the same artifacts as the scoring path.
             scoring_json = {
                 "_early_resolution": True,
                 "_note": "Critique + scoring bypassed",
+                "_consensus_ranking": consensus_ranking,
             }
+            (run_dir / "scoring.json").write_text(json.dumps(scoring_json, indent=2))
             progress("early_resolution", "Unanimous — skipping critique + scoring")
+            record("early_resolution", "ok", "unanimous consensus — synthetic ranking")
         else:
+            record("early_resolution", "ok", "no early resolution")
             progress("critique", "Adversarial critique + reflexion")
             critique_data = self._critique(problem_statement, solver_results, run_dir)
+            record("critique", "ok", f"{len(critique_data)} critiques")
             progress("scoring", "LLM axes → RRF/Borda/hybrid ranking")
             scoring_json, consensus_ranking, scorer_solutions = self._scoring(
                 problem_statement, solver_results, critique_data, run_dir
             )
+            # Honest failure: a scorer that produces no ranking must fail the job
+            # rather than fabricate a winner.
+            if not consensus_ranking:
+                record("scoring", "failed", "empty consensus ranking")
+                raise RuntimeError("Scoring produced empty consensus ranking")
+            record("scoring", "ok", f"{len(consensus_ranking)} ranked")
 
-        assert consensus_ranking is not None
-        assert scorer_solutions is not None
+        if not consensus_ranking or scorer_solutions is None:
+            raise RuntimeError("Scoring produced empty consensus ranking")
 
         progress("synthesis", "Meta-synthesis")
         synthesis = self._synthesis(
@@ -105,11 +138,24 @@ class BoardroomPipeline:
             success_criteria,
             run_dir,
         )
+        record("synthesis", "ok", "synthesis produced")
 
         progress("quality_gate", "Constitutional quality gate")
         quality_gate_result, final_output = self._quality_gate(
             problem_statement, synthesis, consensus_ranking, solver_results, run_dir
         )
+        verdict = quality_gate_result.get("verdict") if quality_gate_result else None
+        if verdict == "ERROR":
+            msg = "Quality gate returned non-JSON/empty output; verdict set to ERROR"
+            warnings.append(msg)
+            degraded = True
+            record("quality_gate", "degraded", msg)
+        elif verdict == "FAIL":
+            record("quality_gate", "ok", "FAIL — fell back to top individual solution")
+        elif quality_gate_result is None:
+            record("quality_gate", "ok", "disabled")
+        else:
+            record("quality_gate", "ok", f"verdict={verdict}")
         (run_dir / "final_output.md").write_text(final_output)
 
         progress("meta_review", "Explaining consensus")
@@ -122,6 +168,7 @@ class BoardroomPipeline:
             quality_gate_result,
             run_dir,
         )
+        record("meta_review", "ok", "meta-review produced")
 
         progress("complete", None)
 
@@ -162,6 +209,10 @@ class BoardroomPipeline:
             "final_output": final_output,
             "meta_review": meta_review,
             "trail": trail,
+            "warnings": warnings,
+            "degraded": degraded,
+            "phase_outcomes": phase_outcomes,
+            # Kept for internal/DB use; main strips it from the HTTP response.
             "artifacts_dir": str(run_dir),
             "reflexion_buffer_size": len(self.reflexion.load()),
         }
@@ -169,12 +220,12 @@ class BoardroomPipeline:
     # ── phases ─────────────────────────────────────────────────────────────
 
     def _orchestrate(
-        self, objective: str, run_dir: Path
+        self, objective: str, run_dir: Path, solver_count: int
     ) -> tuple[str, list[str], list[str], str]:
         settings = self.cfg.get("settings", {})
         model = get_role_model(self.cfg, "orchestrator")
         out = self.llm.complete(
-            build_orchestrator_prompt(objective),
+            build_orchestrator_prompt(objective, solver_count),
             model,
             timeout=float(settings.get("orchestrator_timeout_sec", 120)),
             label="orchestrator",
@@ -194,7 +245,6 @@ class BoardroomPipeline:
         domain = orch_json.get("domain", "general")
 
         if not personas:
-            solver_count = min(int(settings.get("solver_count", 3)), 5)
             personas = [
                 f"Senior {str(domain).title()} Expert {chr(65 + i)}"
                 for i in range(solver_count)
@@ -204,10 +254,13 @@ class BoardroomPipeline:
         return problem_statement, success_criteria, personas, domain
 
     def _parallel_solve(
-        self, problem_statement: str, personas: list[str], run_dir: Path
-    ) -> dict[int, dict[str, Any]]:
+        self,
+        problem_statement: str,
+        personas: list[str],
+        run_dir: Path,
+        solver_count: int,
+    ) -> tuple[dict[int, dict[str, Any]], list[tuple[int, str]]]:
         settings = self.cfg.get("settings", {})
-        solver_count = min(int(settings.get("solver_count", 3)), 5)
         timeout = float(settings.get("solver_timeout_sec", 600))
         min_quorum = int(settings.get("min_solvers_for_quorum", 2))
         reflexion_context = self.reflexion.injection()
@@ -260,7 +313,7 @@ class BoardroomPipeline:
                 f"Insufficient solvers: {len(solver_results)} alive, "
                 f"{min_quorum} required. Dead: {dead}"
             )
-        return solver_results
+        return solver_results, dead
 
     def _early_resolution(
         self,
@@ -304,10 +357,14 @@ class BoardroomPipeline:
         (run_dir / "early_resolution.json").write_text(json.dumps(verdict, indent=2))
 
         if verdict.get("unanimous") and float(verdict.get("confidence", 0)) >= 0.7:
+            # Synthetic ranking for each alive solver in stable (sorted) order.
             consensus_ranking = {
                 f"s{sid}": {
                     "rank": 1,
-                    "note": "unanimous consensus — critique bypassed",
+                    "avg_rank": 1.0,
+                    "rrf_score": 0.0,
+                    "borda_score": 0.0,
+                    "note": "early_resolution",
                 }
                 for sid in sorted(solver_results.keys())
             }
@@ -444,7 +501,7 @@ class BoardroomPipeline:
                 }
             )
 
-        model = get_role_model(self.cfg, "synthesizer")
+        model = get_role_model(self.cfg, "scorer")
         out = self.llm.complete(
             build_scoring_prompt(problem_statement, scorer_solutions),
             model,
@@ -484,6 +541,7 @@ class BoardroomPipeline:
             }
             for sid in sorted(solver_results.keys())
         ]
+        algorithm = settings.get("scoring_algorithm", "hybrid")
         model = get_role_model(self.cfg, "synthesizer")
         synthesis = self.llm.complete(
             build_synthesis_prompt(
@@ -491,6 +549,7 @@ class BoardroomPipeline:
                 solutions_for_prompt,
                 consensus_ranking,
                 success_criteria,
+                algorithm,
             ),
             model,
             timeout=float(settings.get("synthesizer_timeout_sec", 300)),
@@ -538,15 +597,24 @@ class BoardroomPipeline:
             timeout=float(settings.get("synthesizer_timeout_sec", 300)),
             label="quality-gate",
         )
-        try:
-            gate_result = json.loads(extract_json(out)) if out else {}
-        except json.JSONDecodeError:
+        if not out:
+            # Honest degrade: empty gate output cannot certify the synthesis.
             gate_result = {
-                "verdict": "PASS",
-                "reasoning": "Quality gate returned non-JSON — defaulting to PASS.",
+                "verdict": "ERROR",
+                "reasoning": "Quality gate returned empty output — cannot certify.",
             }
+        else:
+            try:
+                gate_result = json.loads(extract_json(out))
+            except json.JSONDecodeError:
+                gate_result = {
+                    "verdict": "ERROR",
+                    "reasoning": "Quality gate returned non-JSON output — cannot certify.",
+                }
         (run_dir / "quality_gate.json").write_text(json.dumps(gate_result, indent=2))
 
+        # FAIL → fall back to the top individual solution (honest downgrade).
+        # ERROR → keep synthesis as final_output; run() adds a warning + degraded.
         if gate_result.get("verdict") == "FAIL":
             return gate_result, top_solution
         return gate_result, synthesis
