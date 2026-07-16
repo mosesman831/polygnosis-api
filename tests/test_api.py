@@ -17,7 +17,13 @@ from polygnosis_api.pipeline import BoardroomPipeline
 from polygnosis_api.schemas import JobStatus
 
 
-def _fake_result(objective: str, job_id: str | None, artifacts_dir: str) -> dict:
+def _fake_result(
+    objective: str,
+    job_id: str | None,
+    artifacts_dir: str,
+    *,
+    include_solutions: bool = True,
+) -> dict:
     return {
         "job_id": job_id or "x",
         "objective": objective,
@@ -30,7 +36,16 @@ def _fake_result(objective: str, job_id: str | None, artifacts_dir: str) -> dict
         "warnings": [],
         "degraded": False,
         "phase_outcomes": [],
-        "trail": [],
+        "trail": [
+            {
+                "solution_id": "s0",
+                "solver": "Expert A",
+                "rank": 1,
+                # Mirror the real pipeline: full text only when requested. main
+                # also strips it belt-and-braces when include_solutions is false.
+                "solution": "FULL SOLUTION TEXT" if include_solutions else None,
+            }
+        ],
         "artifacts_dir": artifacts_dir,
         "reflexion_buffer_size": 0,
     }
@@ -48,10 +63,15 @@ def _client(tmp_path, monkeypatch, service_key: str = "") -> TestClient:
         main_mod.settings, "corrections_buffer", str(tmp_path / "buf.json")
     )
 
-    def fake_run(self, objective, *, job_id=None, on_progress=None):
+    def fake_run(self, objective, *, job_id=None, on_progress=None, include_solutions=True):
         if on_progress:
             on_progress("complete", None)
-        return _fake_result(objective, job_id, str(tmp_path / "artifacts" / "run"))
+        return _fake_result(
+            objective,
+            job_id,
+            str(tmp_path / "artifacts" / "run"),
+            include_solutions=include_solutions,
+        )
 
     monkeypatch.setattr(BoardroomPipeline, "run", fake_run)
     monkeypatch.setattr(main_mod, "store", JobStore(db))
@@ -128,6 +148,109 @@ def test_objective_over_max_returns_422(tmp_path, monkeypatch):
     client = _client(tmp_path, monkeypatch)
     r = client.post("/v1/boardroom", json={"objective": "y" * 51})
     assert r.status_code == 422
+
+
+def test_ready_includes_jobs_counts(tmp_path, monkeypatch):
+    # S5: /ready exposes a per-status jobs count dict via count_by_status().
+    client = _client(tmp_path, monkeypatch)
+    main_mod.store.update(
+        main_mod.store.create({"objective": "seed"}).job_id, status=JobStatus.running
+    )
+    r = client.get("/ready")
+    assert r.status_code == 200
+    jobs = r.json()["jobs"]
+    assert isinstance(jobs, dict)
+    # Every status key is present (0 when none), and the seeded row is counted.
+    for status in JobStatus:
+        assert status.value in jobs
+    assert jobs["running"] == 1
+
+
+def _backdate(store: JobStore, job_id: str, created_at: str) -> None:
+    """Force a job's created_at so list ordering is deterministic in tests."""
+    store._conn.execute(
+        "UPDATE jobs SET created_at = ? WHERE job_id = ?", (created_at, job_id)
+    )
+    store._conn.commit()
+
+
+def test_list_boardroom_newest_first(tmp_path, monkeypatch):
+    # N2: GET /v1/boardroom lists jobs newest-first and requires auth.
+    client = _client(tmp_path, monkeypatch, service_key="secret")
+    headers = {"Authorization": "Bearer secret"}
+
+    ids = []
+    for i in range(3):
+        job = main_mod.store.create({"objective": f"obj{i}"})
+        _backdate(main_mod.store, job.job_id, f"2020-01-01T00:00:0{i}Z")
+        ids.append(job.job_id)
+
+    r = client.get("/v1/boardroom", headers=headers)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["count"] == 3
+    returned = [job["job_id"] for job in body["jobs"]]
+    # Newest (largest created_at) first → reverse of insertion order.
+    assert returned == list(reversed(ids))
+
+
+def test_list_boardroom_requires_auth(tmp_path, monkeypatch):
+    client = _client(tmp_path, monkeypatch, service_key="secret")
+    r = client.get("/v1/boardroom")
+    assert r.status_code == 401
+
+
+def test_list_boardroom_respects_limit(tmp_path, monkeypatch):
+    client = _client(tmp_path, monkeypatch)
+    for i in range(5):
+        main_mod.store.create({"objective": f"obj{i}"})
+    r = client.get("/v1/boardroom", params={"limit": 2})
+    assert r.status_code == 200
+    assert r.json()["count"] == 2
+
+
+def _poll_until_terminal(client, job_id: str) -> dict:
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        poll = client.get(f"/v1/boardroom/{job_id}")
+        assert poll.status_code == 200
+        body = poll.json()
+        if body["status"] in ("completed", "completed_degraded", "failed"):
+            return body
+        time.sleep(0.1)
+    raise AssertionError("job did not reach a terminal status in time")
+
+
+def test_include_solutions_false_nulls_trail(tmp_path, monkeypatch):
+    # S9 (default): trail solution text is null in the HTTP body.
+    with _client(tmp_path, monkeypatch) as client:
+        r = client.post(
+            "/v1/boardroom",
+            json={"objective": "solve it", "include_solutions": False},
+        )
+        assert r.status_code == 202
+        body = _poll_until_terminal(client, r.json()["job_id"])
+
+    assert body["status"] == "completed"
+    trail = body["result"]["trail"]
+    assert trail
+    assert all(item["solution"] is None for item in trail)
+
+
+def test_include_solutions_true_keeps_trail(tmp_path, monkeypatch):
+    # S9: opt-in returns the full solution text in the HTTP trail.
+    with _client(tmp_path, monkeypatch) as client:
+        r = client.post(
+            "/v1/boardroom",
+            json={"objective": "solve it", "include_solutions": True},
+        )
+        assert r.status_code == 202
+        body = _poll_until_terminal(client, r.json()["job_id"])
+
+    assert body["status"] == "completed"
+    trail = body["result"]["trail"]
+    assert trail
+    assert trail[0]["solution"] == "FULL SOLUTION TEXT"
 
 
 def test_post_then_poll_completed(tmp_path, monkeypatch):
