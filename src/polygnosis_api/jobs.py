@@ -274,6 +274,25 @@ class JobStore:
             ).fetchone()
         return self._row_to_job(row)
 
+    def list_jobs(self, limit: int = 20) -> list[Job]:
+        """Return jobs newest-first, capped at ``limit`` rows.
+
+        ``limit`` is clamped to at least 1; callers (the API) enforce the upper
+        bound. Ordering mirrors :meth:`claim_next` (created_at then job_id) but
+        descending so the most recent jobs come first.
+        """
+        limit = max(1, int(limit))
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM jobs
+                ORDER BY created_at DESC, job_id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [self._row_to_job(row) for row in rows]
+
     def count_in_flight(self) -> int:
         with self._lock:
             row = self._conn.execute(
