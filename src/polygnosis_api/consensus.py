@@ -32,15 +32,19 @@ def rrf_rank(solutions_scores: list[dict[str, Any]], k: int = 60) -> list[tuple[
     rrf_scores: dict[str, float] = defaultdict(float)
 
     for axis in SCORING_AXES:
+        # Sort by axis score descending, breaking ties by solution_id ascending.
+        # Negating the score gives descending order while keeping solution_id
+        # ascending in the same key, so equal-score solutions always get the same
+        # deterministic rank regardless of input order.
         ranked = sorted(
             solutions_scores,
-            key=lambda s: s.get("scores", {}).get(axis, 0),
-            reverse=True,
+            key=lambda s: (-s.get("scores", {}).get(axis, 0), s["solution_id"]),
         )
         for rank, sol in enumerate(ranked, start=1):
             rrf_scores[sol["solution_id"]] += 1.0 / (k + rank)
 
-    return sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+    # Break ties on total RRF score by solution_id ascending for determinism.
+    return sorted(rrf_scores.items(), key=lambda x: (-x[1], x[0]))
 
 
 def borda_rank(solutions_scores: list[dict[str, Any]]) -> list[tuple[str, float]]:
@@ -57,15 +61,18 @@ def borda_rank(solutions_scores: list[dict[str, Any]]) -> list[tuple[str, float]
     borda_totals: dict[str, float] = defaultdict(float)
 
     for axis in SCORING_AXES:
+        # Sort by axis score descending, breaking ties by solution_id ascending.
+        # Negating the score keeps score descending while solution_id stays
+        # ascending, so tied solutions receive deterministic Borda points.
         ranked = sorted(
             solutions_scores,
-            key=lambda s: s.get("scores", {}).get(axis, 0),
-            reverse=True,
+            key=lambda s: (-s.get("scores", {}).get(axis, 0), s["solution_id"]),
         )
         for idx, sol in enumerate(ranked):
             borda_totals[sol["solution_id"]] += n - 1 - idx
 
-    return sorted(borda_totals.items(), key=lambda x: x[1], reverse=True)
+    # Break ties on total Borda score by solution_id ascending for determinism.
+    return sorted(borda_totals.items(), key=lambda x: (-x[1], x[0]))
 
 
 def hybrid_rank(
@@ -99,7 +106,9 @@ def hybrid_rank(
         avg = (r + b) / 2.0
         results.append((sid, avg, rrf.get(sid, 0.0), borda.get(sid, 0.0)))
 
-    return sorted(results, key=lambda x: x[1])
+    # Final ordering: lower avg_rank is better; break ties by solution_id
+    # ascending so equal-avg_rank solutions get a stable, deterministic order.
+    return sorted(results, key=lambda x: (x[1], x[0]))
 
 
 def compute_consensus_ranking(

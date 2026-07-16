@@ -9,10 +9,13 @@ from typing import Any
 
 
 class ReflexionBuffer:
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, enabled: bool = True):
         self.path = Path(path)
+        self.enabled = enabled
 
     def load(self) -> list[dict[str, Any]]:
+        if not self.enabled:
+            return []
         try:
             if self.path.exists():
                 data = json.loads(self.path.read_text())
@@ -22,6 +25,8 @@ class ReflexionBuffer:
         return []
 
     def save(self, corrections: list[dict[str, Any]]) -> None:
+        if not self.enabled:
+            return
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self.path.write_text(
@@ -40,6 +45,8 @@ class ReflexionBuffer:
     def ingest_critique(
         self, critique: dict[str, Any], solver_label: str, round_num: int
     ) -> list[dict[str, Any]]:
+        if not self.enabled:
+            return []
         existing = self.load()
         new_entries: list[dict[str, Any]] = []
 
@@ -85,6 +92,8 @@ class ReflexionBuffer:
         return deduped
 
     def injection(self) -> str:
+        if not self.enabled:
+            return ""
         corrections = self.load()
         if not corrections:
             return ""

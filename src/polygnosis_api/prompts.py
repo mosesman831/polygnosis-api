@@ -5,16 +5,17 @@ from __future__ import annotations
 from typing import Any
 
 
-def build_orchestrator_prompt(objective: str) -> str:
+def build_orchestrator_prompt(objective: str, solver_count: int = 3) -> str:
     return (
         "SYSTEM: You are the Boardroom Orchestrator. You prepare a high-stakes problem "
         "for a multi-model debate with specialized expert personas.\n\n"
         "Given the user's objective, produce:\n"
         "1. A SINGLE self-contained problem statement (requirements, constraints, "
         "success criteria, edge cases, expected output format)\n"
-        "2. A list of specialized EXPERT PERSONAS to solve the problem — one per solver. "
-        "These should be DIFFERENT roles with complementary expertise relevant to the "
-        "problem domain. Examples: for database optimization → \"DBA Consultant\", "
+        f"2. A list of EXACTLY {solver_count} specialized EXPERT PERSONAS to solve the "
+        "problem — one per solver. Return exactly this many personas, no more and no "
+        "fewer. These should be DIFFERENT roles with complementary expertise relevant "
+        "to the problem domain. Examples: for database optimization → \"DBA Consultant\", "
         "\"Backend Architect\", \"Security Auditor\". For a compiler task → "
         "\"Parser Designer\", \"Optimization Engineer\", \"Type System Expert\".\n\n"
         "Return JSON ONLY. Schema:\n"
@@ -175,6 +176,7 @@ def build_synthesis_prompt(
     solutions: list[dict],
     consensus_ranking: dict[str, Any],
     success_criteria: list[str],
+    algorithm: str = "hybrid",
 ) -> str:
     ranking_text = ""
     for sid, rank_info in sorted(
@@ -204,7 +206,7 @@ def build_synthesis_prompt(
         "5. The final output must be SELF-CONTAINED — no 'see solution X' references\n\n"
         f"PROBLEM:\n{problem_statement}\n\n"
         f"SUCCESS CRITERIA:\n{chr(10).join('- ' + c for c in success_criteria)}\n\n"
-        f"FORMAL CONSENSUS RANKING (RRF + Borda hybrid):\n{ranking_text}\n"
+        f"FORMAL CONSENSUS RANKING ({algorithm} algorithm):\n{ranking_text}\n"
         f"ALL SOLUTIONS:\n{formatted_solutions}\n\n"
         "Now produce the FINAL UNIFIED SOLUTION:"
     )

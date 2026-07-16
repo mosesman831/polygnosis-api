@@ -130,3 +130,121 @@ def test_single_solution_edge_case():
 def test_empty_scoring_returns_empty():
     assert compute_consensus_ranking({}, algorithm="hybrid") == {}
     assert compute_consensus_ranking(None, algorithm="rrf") == {}
+
+
+def _tied_scores():
+    # Two solutions with identical scores on every axis; a third clearly worse.
+    # Provide out-of-order solution_ids to prove deterministic tie-breaking.
+    return [
+        {
+            "solution_id": "s2",
+            "scores": {a: 5 for a in ["correctness", "efficiency",
+                                      "maintainability", "robustness", "security"]},
+        },
+        {
+            "solution_id": "s1",
+            "scores": {a: 5 for a in ["correctness", "efficiency",
+                                      "maintainability", "robustness", "security"]},
+        },
+        {
+            "solution_id": "s3",
+            "scores": {a: 1 for a in ["correctness", "efficiency",
+                                      "maintainability", "robustness", "security"]},
+        },
+    ]
+
+
+def test_axis_ties_broken_by_solution_id_ascending():
+    # For rrf/borda, tied axis scores must resolve to solution_id ascending,
+    # regardless of the input order (s2 listed before s1).
+    rrf = rrf_rank(_tied_scores(), k=60)
+    borda = borda_rank(_tied_scores())
+    # s1 and s2 tie on every axis; s1 must consistently outrank s2 (ascending id).
+    rrf_order = [sid for sid, _ in rrf]
+    borda_order = [sid for sid, _ in borda]
+    assert rrf_order.index("s1") < rrf_order.index("s2")
+    assert borda_order.index("s1") < borda_order.index("s2")
+    # The worse solution s3 is always last.
+    assert rrf_order[-1] == "s3"
+    assert borda_order[-1] == "s3"
+
+
+def test_axis_tie_determinism_independent_of_input_order():
+    forward = rrf_rank(_tied_scores(), k=60)
+    reversed_input = rrf_rank(list(reversed(_tied_scores())), k=60)
+    assert [sid for sid, _ in forward] == [sid for sid, _ in reversed_input]
+
+
+def test_missing_axis_defaults_to_zero():
+    # s0 omits several axes entirely; missing scores default to 0.
+    sols = [
+        {"solution_id": "s0", "scores": {"correctness": 3}},
+        {
+            "solution_id": "s1",
+            "scores": {a: 9 for a in ["correctness", "efficiency",
+                                      "maintainability", "robustness", "security"]},
+        },
+    ]
+    # Should not raise; s1 dominates because s0's missing axes are treated as 0.
+    borda = dict(borda_rank(sols))
+    rrf = dict(rrf_rank(sols))
+    assert borda["s1"] > borda["s0"]
+    assert rrf["s1"] > rrf["s0"]
+
+
+def test_compute_consensus_ranking_rrf_shape():
+    scoring = {
+        "rankings": [
+            {"solution_id": s["solution_id"], "scores": s["scores"]}
+            for s in _sample_scores()
+        ]
+    }
+    result = compute_consensus_ranking(scoring, algorithm="rrf", k=60)
+    assert set(result) == {"s0", "s1", "s2"}
+    for entry in result.values():
+        assert set(entry) == {"rank", "score"}
+        assert isinstance(entry["rank"], int)
+        assert isinstance(entry["score"], float)
+    assert result["s1"]["rank"] == 1
+
+
+def test_compute_consensus_ranking_borda_shape():
+    scoring = {
+        "rankings": [
+            {"solution_id": s["solution_id"], "scores": s["scores"]}
+            for s in _sample_scores()
+        ]
+    }
+    result = compute_consensus_ranking(scoring, algorithm="borda", k=60)
+    for entry in result.values():
+        assert set(entry) == {"rank", "score"}
+    assert result["s1"]["rank"] == 1
+
+
+def test_compute_consensus_ranking_custom_k():
+    scoring = {
+        "rankings": [
+            {"solution_id": s["solution_id"], "scores": s["scores"]}
+            for s in _sample_scores()
+        ]
+    }
+    # A different k changes the raw rrf scores but keeps the ordering here.
+    small_k = compute_consensus_ranking(scoring, algorithm="rrf", k=1)
+    large_k = compute_consensus_ranking(scoring, algorithm="rrf", k=1000)
+    assert small_k["s1"]["score"] != large_k["s1"]["score"]
+    assert small_k["s1"]["rank"] == 1
+    assert large_k["s1"]["rank"] == 1
+
+
+def test_hybrid_tie_break_by_solution_id():
+    # Two fully-tied solutions must order by solution_id ascending in hybrid.
+    result = compute_consensus_ranking(
+        {"rankings": [
+            {"solution_id": s["solution_id"], "scores": s["scores"]}
+            for s in _tied_scores()
+        ]},
+        algorithm="hybrid",
+        k=60,
+    )
+    assert result["s1"]["rank"] < result["s2"]["rank"]
+    assert result["s3"]["rank"] == 3
