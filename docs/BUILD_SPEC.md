@@ -1,7 +1,6 @@
 # Build spec — PolyGnosis API v0.2 (production / OSS cut)
 
-Status: **ready to build**. This freezes choices from `docs/PRODUCTION_OSS_PLAN.md`.
-Implement everything in this document. Do not invent extras outside Deferred.
+Status: **built** in v0.2.0 — see commits on this branch. Deferred items remain out of scope.
 
 Target version: **`0.2.0`** (honest pre-1.0). Bump `pyproject.toml` only; import version from package metadata.
 
