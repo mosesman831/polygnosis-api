@@ -1,6 +1,6 @@
 # Production / OSS readiness plan
 
-Status: **plan only** (no implementation yet). Approve milestones before build.
+Status: **accepted** — frozen into `docs/BUILD_SPEC.md` for the v0.2 build.
 
 Derived from `SPEC.md`, the current `src/polygnosis_api` tree, and an architecture review of what actually blocks a trustworthy public release.
 
